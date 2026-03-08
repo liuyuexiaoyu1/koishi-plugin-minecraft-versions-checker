@@ -4,6 +4,7 @@ export const name = 'minecraft-versions-checker'
 
 export interface Config {
   interval: number
+  broadcast: boolean
   groups: string[]
   enableRelease: boolean
   enableSnapshot: boolean
@@ -16,6 +17,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   interval: Schema.number().default(60).description('检查间隔（秒）'),
+  broadcast: Schema.boolean().default(true).description('是否广播到所有群聊，打开后忽略群列表'),
   groups: Schema.array(String).role('table').description('要发送通知的群列表'),
   enableRelease: Schema.boolean().default(true).description('启用正式版通知'),
   enableSnapshot: Schema.boolean().default(true).description('启用快照版通知'),
@@ -64,52 +66,58 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function detectVersionType(versionId: string): string {
-    const versionLower = versionId.toLowerCase()
-    
-    if (versionLower.includes('pre')) return 'pre-release'
-    if (versionLower.includes('rc')) return 'release-candidate'
-    
-    const snapshotPattern = /^\d+w\d+[a-z]$/
-    if (snapshotPattern.test(versionLower)) return 'snapshot'
-    
-    const releasePattern = /^\d+\.\d+(\.\d+)?$/
-    if (releasePattern.test(versionLower)) return 'release'
-    
-    return 'unknown'
+    const v = versionId.toLowerCase();
+  
+    if (/^\d{2}\.\d+-snapshot-\d+$/.test(v)) {
+      return 'snapshot';
+    }
+    if (/^\d{2}\.\d+-pre-\d+$/.test(v)) {
+      return 'pre-release';
+    }
+    if (/^\d{2}\.\d+-rc-\d+$/.test(v)) {
+      return 'release-candidate';
+    }
+    if (/^\d{2}\.\d+(\.\d+)?$/.test(v)) {
+      return 'release';
+    }
+  
+    return 'unknown';
   }
 
   function generateArticleUrl(versionInfo: VersionInfo): string {
-    const versionId = versionInfo.id
-    const versionType = detectVersionType(versionId)
-    
-    switch (versionType) {
-      case 'release':
-        const versionSlug = versionId.replace(/\./g, '-')
-        return `https://www.minecraft.net/zh-hans/article/minecraft-java-edition-${versionSlug}`
-      
-      case 'snapshot':
-        return `https://www.minecraft.net/zh-hans/article/minecraft-snapshot-${versionId}`
-      
-      case 'pre-release':
-        if (versionId.includes('-')) {
-          const [basePart, prePart] = versionId.split('-', 2)
-          const baseSlug = basePart.replace(/\./g, '-')
-          const preNum = prePart.includes('.') ? prePart.split('.')[1] : '1'
-          return `https://www.minecraft.net/zh-hans/article/minecraft-${baseSlug}-pre-release-${preNum}`
-        }
-        break
-      
-      case 'release-candidate':
-        if (versionId.includes('-')) {
-          const [basePart, rcPart] = versionId.split('-', 2)
-          const baseSlug = basePart.replace(/\./g, '-')
-          const rcNum = rcPart.includes('.') ? rcPart.split('.')[1] : '1'
-          return `https://www.minecraft.net/zh-hans/article/minecraft-${baseSlug}-release-candidate-${rcNum}`
-        }
-        break
+    const id = versionInfo.id;
+    const type = detectVersionType(id);
+  
+    if (type === 'release') {
+      const slug = id.replace(/\./g, '-');
+      return `https://www.minecraft.net/zh-hans/article/minecraft-java-edition-${slug}`;
     }
-    
-    return `未知版本类型: ${versionId}`
+  
+    const match = id.match(/^(\d{2}\.\d+)-([a-z]+)-(\d+)$/);
+    if (match) {
+      const baseVersion = match[1].replace(/\./g, '-');
+      const kind = match[2];
+      const number = match[3];
+  
+      let articleKind: string;
+      switch (kind) {
+        case 'snapshot':
+          articleKind = 'snapshot';
+          break;
+        case 'pre':
+          articleKind = 'pre-release';
+          break;
+        case 'rc':
+          articleKind = 'release-candidate';
+          break;
+        default:
+          return `未知版本类型: ${id}`;
+      }
+  
+      return `https://www.minecraft.net/zh-hans/article/minecraft-${baseVersion}-${articleKind}-${number}`;
+    }
+  
+    return `无法生成文章链接: ${id}`;
   }
 
   function getVersionTypeName(versionType: string): string {
@@ -174,14 +182,30 @@ export function apply(ctx: Context, config: Config) {
     }
     
     const message = generateGroupMessage(versionInfo)
+    if (!config.broadcast) {
       for (const groupId of effectiveConfig.groups) {
         try {
           await ctx.broadcast([groupId], message)
-         
         } catch (error) {
           logger.error(`向群 ${groupId} 发送消息失败:`, error)
         }
       }
+    } else {
+      try {
+        for (const bot of ctx.bots) {
+          const { data: guilds } = await bot.getGuildList()
+          const guildIds = guilds.map(g => g.id)
+          if (guildIds.length > 0) {
+            await ctx.broadcast(guildIds, message)
+            logger.info(`已向 ${guildIds.length} 个群组广播更新消息: ${versionInfo.id}`)
+          } else {
+            logger.debug('未发现可发送的群组')
+          }
+        }
+      } catch (error) {
+        logger.error('广播消息失败:', error)
+      }
+    }
   }
 
   
