@@ -1,6 +1,7 @@
 import { Context, Schema, h } from 'koishi'
 
 export const name = 'minecraft-versions-checker'
+export const inject = ['database']
 
 export interface Config {
   interval: number
@@ -90,7 +91,7 @@ export function apply(ctx: Context, config: Config) {
   
     if (type === 'release') {
       const slug = id.replace(/\./g, '-');
-      return `https://www.minecraft.net/zh-hans/article/minecraft-java-edition-${slug}`;
+      return `https://www.minecraft.net/en-us/article/minecraft-java-edition-${slug}`;
     }
   
     const match = id.match(/^(\d{2}\.\d+)-([a-z]+)-(\d+)$/);
@@ -196,7 +197,10 @@ export function apply(ctx: Context, config: Config) {
           const { data: guilds } = await bot.getGuildList()
           const guildIds = guilds.map(g => g.id)
           if (guildIds.length > 0) {
-            await ctx.broadcast(guildIds, message)
+            for (const groupId of guildIds) {
+              const finalGroupId = bot.platform + ":" + groupId
+              await ctx.broadcast([finalGroupId], message)
+            }
             logger.info(`已向 ${guildIds.length} 个群组广播更新消息: ${versionInfo.id}`)
           } else {
             logger.debug('未发现可发送的群组')
