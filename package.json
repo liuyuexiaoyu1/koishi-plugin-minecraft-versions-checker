@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-minecraft-versions-checker",
   "description": "定期检查mc的版本更新，并群发到群聊",
-  "version": "1.1.5",
+  "version": "1.2.0",
   "main": "lib/index.js",
   "contributors": [
     "Liuyue_awa <liuyuexiaoyu1@outlook.com>"
@@ -25,6 +25,9 @@
     "description": {
       "en": "Regularly check for Minecraft version updates and send group messages to group chats",
       "zh": "定期检查mc的版本更新，并群发到群聊"
+    },
+    "service": {
+      "required": ["database"]
     }
   },
   "peerDependencies": {
