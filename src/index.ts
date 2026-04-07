@@ -1,4 +1,6 @@
-import { Context, Schema, h } from 'koishi'
+import { Context, Schema } from 'koishi'
+import axios from 'axios'
+import { Readable } from 'stream'
 
 export const name = 'minecraft-versions-checker'
 export const inject = ['database']
@@ -15,6 +17,7 @@ export interface Config {
   messageTemplate: string
   useProxy: boolean
   proxyUrl: string
+  enableTruncate: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -27,10 +30,11 @@ export const Config: Schema<Config> = Schema.object({
   enablePreRelease: Schema.boolean().default(true).description('启用预发布版通知'),
   enableReleaseCandidate: Schema.boolean().default(true).description('启用发布候选通知'),
   messageTemplate: Schema.string()
-    .default('【MC更新】发现新的Minecraft{type}：{version}\n文章地址：{url}')
+    .default('【MC更新】发现新的Minecraft {type}：{version}\n文章地址：{url}')
     .description('消息模板，可用变量：{type}版本类型, {version}版本号, {url}文章地址'),
   useProxy: Schema.boolean().default(false).description('是否使用代理'),
   proxyUrl: Schema.string().default('http://127.0.0.1:7890').description('代理地址'),
+  enableTruncate: Schema.boolean().default(true).description('启用流式截断（大幅节省流量，仅拉取最新的4个版本）'),
 })
 
 interface VersionInfo {
@@ -68,29 +72,13 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function generateArticleUrl(versionInfo: VersionInfo): string {
+    if (!versionInfo) return 'N/A'
     const id = versionInfo.id
     const type = detectVersionType(id)
-
     if (type === 'release') {
-      const slug = id.replace(/\./g, '-')
-      return `https://www.minecraft.net/en-us/article/minecraft-java-edition-${slug}`
+      return `https://www.minecraft.net/en-us/article/minecraft-java-edition-${id.replace(/\./g, '-')}`
     }
-
-    const match = id.match(/^([\d\.]+)-([a-z]+)-(\d+)$/)
-    if (match) {
-      const baseVersion = match[1].replace(/\./g, '-')
-      const kind = match[2]
-      const number = match[3]
-
-      let articleKind = kind === 'pre' ? 'pre-release' : kind === 'rc' ? 'release-candidate' : kind
-      return `https://www.minecraft.net/en-us/article/minecraft-${baseVersion}-${articleKind}-${number}`
-    }
-
-    if (/^\d{2}w\d+[a-z]$/.test(id)) {
-      return `https://www.minecraft.net/en-us/article/minecraft-snapshot-${id}`
-    }
-
-    return `https://www.minecraft.net/en-us/article/minecraft-java-edition-${id.replace(/\./g, '-')}`
+    return `https://www.minecraft.net/en-us/article/minecraft-snapshot-${id}`
   }
 
   function getVersionTypeName(versionType: string): string {
@@ -103,22 +91,76 @@ export function apply(ctx: Context, config: Config) {
     return typeMap[versionType] || versionType
   }
 
-  async function fetchVersionManifest(): Promise<VersionManifest> {
-    const httpConfig: any = { timeout: 10000 }
-    if (config.useProxy && config.proxyUrl) {
-      const url = new URL(config.proxyUrl)
-      httpConfig.proxy = {
-        protocol: url.protocol.replace(':', ''),
-        host: url.hostname,
-        port: parseInt(url.port)
-      }
+  async function fetchVersionManifest(forceFull = false): Promise<VersionManifest> {
+    const useTruncate = config.enableTruncate && !forceFull
+  
+    if (!useTruncate) {
+      const { data } = await axios.get(
+        'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json',
+        { timeout: 10000 }
+      )
+      return data
     }
-    return await ctx.http.get('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json', httpConfig)
+  
+    const response = await axios.get(
+      'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json',
+      {
+        responseType: 'stream',
+        timeout: 10000,
+        proxy: config.useProxy ? {
+          protocol: new URL(config.proxyUrl).protocol.replace(':', ''),
+          host: new URL(config.proxyUrl).hostname,
+          port: parseInt(new URL(config.proxyUrl).port)
+        } : undefined
+      }
+    )
+  
+    const stream: Readable = response.data
+  
+    let buffer = ''
+  
+    return new Promise((resolve, reject) => {
+      stream.on('data', (chunk) => {
+        buffer += chunk.toString()
+  
+        const latestMatch = buffer.match(
+          /"latest"\s*:\s*\{"release":"([^"]+)","snapshot":"([^"]+)"\}/
+        )
+  
+        const versionBlocks = buffer.match(
+          /\{"id":"[^"]+","type":"[^"]+","url":"[^"]+","time":"[^"]+","releaseTime":"[^"]+","sha1":"[^"]+","complianceLevel":\d+\}/g
+        )
+  
+        if (latestMatch && versionBlocks && versionBlocks.length >= 4) {
+          try {
+            const latest = {
+              release: latestMatch[1],
+              snapshot: latestMatch[2],
+            }
+  
+            const versions = versionBlocks.map(v => JSON.parse(v))
+  
+            stream.destroy()
+            resolve({ latest, versions } as VersionManifest)
+          } catch {
+          }
+        }
+      })
+  
+      stream.on('end', () => {
+        try {
+          resolve(JSON.parse(buffer))
+        } catch {
+          reject(new Error('流结束但解析失败'))
+        }
+      })
+  
+      stream.on('error', reject)
+    })
   }
 
   async function sendGroupMessage(versionInfo: VersionInfo) {
     const versionType = detectVersionType(versionInfo.id)
-    
     const isEnabled = 
       (versionType === 'release' && config.enableRelease) ||
       (versionType === 'snapshot' && config.enableSnapshot) ||
@@ -143,13 +185,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function dispatch() {
     if (runningTasks >= (config.maxConcurrency || 10) || taskQueue.length === 0) return
-
     const task = taskQueue.shift()
     if (task) {
       runningTasks++
-      try {
-        await task()
-      } finally {
+      try { await task() } finally {
         runningTasks--
         dispatch()
       }
@@ -158,24 +197,21 @@ export function apply(ctx: Context, config: Config) {
 
   async function performCheck() {
     try {
-      const manifest = await fetchVersionManifest()
+      const manifest = await fetchVersionManifest(isFirstRun)
       
       if (isFirstRun) {
         manifest.versions.forEach(v => knownVersions.add(v.id))
         isFirstRun = false
-        logger.info('Minecraft 版本检查初始化完成')
+        logger.info(`初始化完成，已记录 ${knownVersions.size} 个版本`)
         return
       }
 
       const newVersions = manifest.versions.filter(v => !knownVersions.has(v.id))
-      
       if (newVersions.length > 0) {
         newVersions.forEach(v => knownVersions.add(v.id))
-        
         newVersions.sort((a, b) => new Date(b.releaseTime).getTime() - new Date(a.releaseTime).getTime())
         for (const version of newVersions) {
           await sendGroupMessage(version)
-          await new Promise(r => setTimeout(r, 1000))
         }
       }
     } catch (error) {
@@ -184,26 +220,33 @@ export function apply(ctx: Context, config: Config) {
   }
 
   ctx.command('mc-check', '手动检查Minecraft版本更新')
-    .action(async ({ session }) => {
-      try {
-        const manifest = await fetchVersionManifest()
-        const latestRel = manifest.versions.find(v => v.id === manifest.latest.release)
-        const latestSnp = manifest.versions.find(v => v.id === manifest.latest.snapshot)
-        
-        return `当前最新版本：\n正式版: ${latestRel?.id || '未知'}\n文章: ${generateArticleUrl(latestRel)}\n\n快照版: ${latestSnp?.id || '未知'}\n文章: ${generateArticleUrl(latestSnp)}`
-      } catch (e) {
-        return '检查失败，请检查网络或代理设置'
-      }
-    })
+  .action(async () => {
+    try {
+      const manifest = await fetchVersionManifest()
 
-  ctx.command('mc-status', '查看版本检查器状态', { authority: 3 })
+      const latestRel = manifest.versions.find(v => v.id === manifest.latest.release)
+      const latestSnp = manifest.versions.find(v => v.id === manifest.latest.snapshot)
+
+      const relText = latestRel
+        ? `正式版: ${latestRel.id}\n${generateArticleUrl(latestRel)}`
+        : '正式版: 未知'
+
+      const snpText = latestSnp
+        ? `快照版: ${latestSnp.id}\n${generateArticleUrl(latestSnp)}`
+        : '快照版: 未知'
+
+      return `当前最新版本：\n\n${relText}\n\n${snpText}`
+    } catch (e) {
+      return '手动检查失败：' + e.message
+    }
+  })
+
+  ctx.command('mc-status', '查看插件状态', { authority: 3 })
     .action(() => {
       return [
-        `并发状态: ${runningTasks}/${config.maxConcurrency}`,
-        `排队任务: ${taskQueue.length}`,
+        `运行状态: ${runningTasks}/${config.maxConcurrency}`,
         `已知版本: ${knownVersions.size}`,
-        `检查频率: ${config.interval}s`,
-        `代理状态: ${config.useProxy ? '已开启' : '关闭'}`
+        `流式模式: ${config.enableTruncate ? '开启' : '关闭'}`
       ].join('\n')
     })
 
@@ -214,9 +257,8 @@ export function apply(ctx: Context, config: Config) {
 
   ctx.on('dispose', () => {
     clearInterval(timer)
-    taskQueue.length = 0
   })
-
+  
   taskQueue.push(performCheck)
   dispatch()
 }
