@@ -78,7 +78,7 @@ export function apply(ctx: Context, config: Config) {
     if (type === 'release') {
       return `https://www.minecraft.net/en-us/article/minecraft-java-edition-${id.replace(/\./g, '-')}`
     }
-    return `https://www.minecraft.net/en-us/article/minecraft-snapshot-${id}`
+    return `https://www.minecraft.net/en-us/article/minecraft-${id.replace(/\./g, '-')}`
   }
 
   function getVersionTypeName(versionType: string): string {
